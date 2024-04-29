@@ -1,0 +1,345 @@
+// Reference: 0Harmony
+using CompanionServer;
+using ConVar;
+using Facepunch;
+using Facepunch.Math;
+using HarmonyLib;
+using Oxide.Core;
+using System;
+using System.Diagnostics;
+using System.Reflection;
+using System.Text;
+using UnityEngine;
+using Harmony = HarmonyLib.Harmony;
+using System.Threading.Tasks;
+
+namespace Oxide.Plugins
+{
+    [Info("ChatOverride", "Shady", "1.0.0", ResourceId = 0)]
+    internal class ChatOverride : RustPlugin
+    {
+        private const int MAXIMUM_CHARACTER_LIMIT = 384;
+        #region Fields
+        private Harmony _harmony;
+
+        #endregion
+
+
+        #region Hooks
+        private void Init() => DoHarmonyPatches(_harmony = new Harmony(GetType().Name));
+
+        private void Unload() => _harmony?.UnpatchAll(nameof(ChatOverride));
+        #endregion
+
+        #region Custom Harmony Methods
+        private void DoHarmonyPatches(Harmony instance)
+        {
+            var c = 0;
+
+            var watch = Facepunch.Pool.Get<Stopwatch>();
+            try { c = PatchAllHarmonyAttributes(GetType(), instance); }
+            finally
+            {
+                var elapsedMs = watch.ElapsedMilliseconds;
+                Facepunch.Pool.Free(ref watch);
+
+                var sb = Facepunch.Pool.Get<StringBuilder>();
+                try { PrintWarning(sb.Clear().Append("Took: ").Append(elapsedMs.ToString("0.00").Replace(".00", string.Empty)).Append("ms to apply ").Append(c.ToString("N0")).Append(" patch").Append(c > 1 ? "es" : string.Empty).ToString()); }
+                finally { Facepunch.Pool.Free(ref sb); }
+            }
+
+        }
+
+        private int PatchAllHarmonyAttributes(Type type, Harmony harmony, BindingFlags? flags = null)
+        {
+            var patched = 0;
+
+
+            var types = Assembly.GetExecutingAssembly().GetTypes();
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                var t = types[i];
+
+                if (t != type && t.IsClass && t.FullName.Contains(type.FullName))
+                {
+                    var attributes = Attribute.GetCustomAttributes(t);
+                    for (int j = 0; j < attributes.Length; j++)
+                    {
+                        var patch = attributes[j] as HarmonyPatch;
+                        if (patch == null) continue;
+
+                        var originalMethod = patch.info.declaringType.GetMethod(patch.info.methodName, (flags != null && flags.HasValue) ? (BindingFlags)flags : BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy);
+
+                        if (originalMethod == null)
+                        {
+                            PrintWarning("originalMethod is null!! patch.info.methodName: " + patch.info.methodName + Environment.NewLine + "patch.info.declaringType: " + patch.info.declaringType.FullName);
+                            continue;
+                        }
+
+                        HarmonyMethod prefix = null;
+                        HarmonyMethod postfix = null;
+
+                        var prefixMethod = t.GetMethod("Prefix", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                        var postFixMethod = t.GetMethod("Postfix", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+
+                        if (prefixMethod != null) prefix = new HarmonyMethod(prefixMethod);
+                        if (postFixMethod != null) postfix = new HarmonyMethod(postFixMethod);
+
+                        harmony.Patch(originalMethod, prefix, postfix);
+
+                        patched++;
+
+                    }
+                }
+
+            }
+
+            return patched;
+        }
+        #endregion
+
+      
+
+       
+        #region Chat Cooldown Patch
+        [HarmonyPatch(typeof(Chat), "sayImpl", new[] { typeof(Chat.ChatChannel), typeof(ConsoleSystem.Arg) })]
+        private class ChatImplPatch
+        {
+            private static readonly MethodInfo _sayAs = typeof(Chat).GetMethod("sayAs", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy);
+
+            private static bool Prefix(Chat.ChatChannel targetChannel, ConsoleSystem.Arg arg)
+            {
+                if (!Chat.enabled)
+                {
+                    arg.ReplyWith("Chat is disabled.");
+                    return false;
+                }
+                else
+                {
+                    BasePlayer player = arg.Player();
+                    if (!(bool)((UnityEngine.Object)player) || player.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute))
+                        return false;
+
+                    string message = arg.GetString(0, "text");
+                    if (!message.StartsWith("/", StringComparison.OrdinalIgnoreCase) && !message.StartsWith("&", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!player.IsAdmin && !player.IsDeveloper)
+                        {
+                            if (player.NextChatTime == 0.0)
+                                player.NextChatTime = UnityEngine.Time.realtimeSinceStartup - 30f;
+
+                            if (player.NextChatTime > UnityEngine.Time.realtimeSinceStartup)
+                            {
+
+                                player.NextChatTime += 2f;
+                                var num = player.NextChatTime - UnityEngine.Time.realtimeSinceStartup;
+
+                                ConsoleNetwork.SendClientCommand(player.net.connection, "chat.add", 2, 0, "You're chatting too fast - try again in " + (num + 0.5f).ToString("0") + " seconds");
+
+                                if (num <= 120)
+                                    return false;
+
+                                player.Kick("Chatting too fast");
+                                return false;
+                            }
+                        }
+                    }
+
+                    var valObj = _sayAs.Invoke(null, new object[] { targetChannel, player.userID, player.displayName, message, player });
+
+                    // Use reflection to call the GetAwaiter method
+                    var awaiter = valObj.GetType().GetMethod("GetAwaiter", BindingFlags.Instance | BindingFlags.Public).Invoke(valObj, null);
+
+                    // Use reflection to call the GetResult method on the Awaiter
+                    var result = (bool)awaiter.GetType().GetMethod("GetResult", BindingFlags.Instance | BindingFlags.Public).Invoke(awaiter, null);
+
+                    // Create a new ValueTask<bool> with the result
+                    var valTask = new ValueTask<bool>(result);
+
+                    if (valTask.IsCompletedSuccessfully)
+                    {
+                        if (valTask.Result)
+                            return false;
+                        player.NextChatTime = UnityEngine.Time.realtimeSinceStartup;
+                    }
+                    else
+                    {
+                        Interface.Oxide.LogWarning("valTask not yet completed?");
+
+                        var task = valTask.AsTask();
+
+                        task.GetAwaiter().OnCompleted((Action)(() =>
+                        {
+                            try
+                            {
+                                if (task.Result)
+                                    return;
+                                player.NextChatTime = UnityEngine.Time.realtimeSinceStartup;
+                            }
+                            catch (Exception ex)
+                            {
+                                UnityEngine.Debug.LogError((object)ex);
+                            }
+                        }));
+
+                    }
+
+               //     var valTask = _sayAs.Invoke(null, new object[] { targetChannel, player.userID, player.displayName, message, player }) as ValueTask<bool>;
+
+
+
+                    //  var val = _sayAs.Invoke(null, new object[] { targetChannel, player.userID, player.displayName, message, player });
+                    //    if (!(bool)val) return true;
+
+                }
+
+                return false;
+            }
+        }
+        #endregion
+        #region Chat Patch
+        //shit's fucked. how patch async task?
+        //what i tried below doesn't work - won't compile. impossible through harmony? impossible with this C# compiler?
+
+        [HarmonyPatch(typeof(Chat), "sayAs",  new[] { typeof(Chat.ChatChannel), typeof(ulong), typeof(string), typeof(string), typeof(BasePlayer) })]
+        private class ChatPatch
+        {
+
+            private static bool Prefix(Chat.ChatChannel targetChannel, ulong userId, string username, string message, ref object __result, BasePlayer player = null)
+            {
+                var resultField = __result.GetType().GetField("_result", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy);
+
+                if (!Chat.enabled || player != null && player.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute))
+                {
+                    resultField.SetValue(__result, false);
+                    return false;
+                }
+
+                var user = ServerUsers.Get(userId);
+                var userGroup = user != null ? user.group : ServerUsers.UserGroup.None;
+
+                if (userGroup == ServerUsers.UserGroup.Banned)
+                {
+                    resultField.SetValue(__result, false);
+                    return false;
+                }
+
+                var sb = Facepunch.Pool.Get<StringBuilder>();
+                string str1;
+                try 
+                {
+                    var initSb = sb.Clear().Append(message).Replace("\n", string.Empty).Replace("\r", string.Empty);
+                    if (initSb.Length > MAXIMUM_CHARACTER_LIMIT) initSb.Length = MAXIMUM_CHARACTER_LIMIT;
+
+                    str1 = initSb.ToString().Trim();
+                }
+                finally { Facepunch.Pool.Free(ref sb); }
+               
+
+                if (string.IsNullOrEmpty(str1))
+                {
+                    resultField.SetValue(__result, false);
+                    return false;
+                }
+
+                if (str1.StartsWith("/", StringComparison.OrdinalIgnoreCase) || str1.StartsWith("\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    Interface.CallHook("IOnPlayerCommand", player, message);
+                    resultField.SetValue(__result, true);
+                    return false;
+                }
+
+                string message1 = str1.EscapeRichText();
+
+                object obj = Interface.CallHook("IOnPlayerChat", userId, username, message1, targetChannel, player);
+                if (obj is bool)
+                {
+                    resultField.SetValue(__result, (bool)obj);
+                    return false;
+                }
+                   
+                if (Chat.serverlog)
+                {
+                    ServerConsole.PrintColoured(ConsoleColor.DarkYellow, "[" + targetChannel + "] " + username + ": ", ConsoleColor.DarkGreen, message1);
+                    string str2 = (player?.ToString()) ?? string.Format("{0}[{1}]", username, userId);
+                    if (targetChannel == Chat.ChatChannel.Team)
+                        DebugEx.Log("[TEAM CHAT] " + str2 + " : " + message1, StackTraceLogType.None);
+                    else
+                        DebugEx.Log("[CHAT] " + str2 + " : " + message1, StackTraceLogType.None);
+                }
+
+                bool flag = userGroup == ServerUsers.UserGroup.Owner || userGroup == ServerUsers.UserGroup.Moderator;
+
+                int num1 = player != null ? (player.IsDeveloper ? 1 : 0) : (DeveloperList.Contains(userId) ? 1 : 0);
+
+                var color = flag ? "#af5" : (num1 != 0) ? "#fa5" : "#5af";
+
+
+                var name = username.EscapeRichText();
+
+                var chatEntry = new Chat.ChatEntry()
+                {
+                    Channel = targetChannel,
+                    Message = message1,
+                    UserId = player != null ? player.UserIDString : userId.ToString(),
+                    Username = username,
+                    Color = color,
+                    Time = Epoch.Current
+                };
+
+                Chat.Record(chatEntry);
+
+                if (targetChannel != Chat.ChatChannel.Global)
+                {
+                    if (targetChannel == Chat.ChatChannel.Team)
+                    {
+                        RelationshipManager.PlayerTeam playersTeam = RelationshipManager.ServerInstance?.FindPlayersTeam(userId);
+                        if (playersTeam == null)
+                        {
+                            resultField.SetValue(__result, false);
+                            return false;
+                        }
+                         
+                        var memberConnections = playersTeam.GetOnlineMemberConnections();
+                        if (memberConnections != null)
+                            ConsoleNetwork.SendClientCommand(memberConnections, "chat.add2", 1, userId, message1, name, color, 1f);
+
+                        playersTeam.BroadcastTeamChat(userId, name, message1, color);
+
+                        resultField.SetValue(__result, true);
+                        return false;
+                    }
+                }
+                else if (ConVar.Chat.globalchat)
+                {
+                    ConsoleNetwork.BroadcastToAllClients("chat.add2", 0, userId, message1, name, color, 1f);
+                    resultField.SetValue(__result, true);
+                    return false;
+                }
+
+                if (player == null)
+                {
+                    resultField.SetValue(__result, false);
+                    return false;
+                }
+
+                var num2 = 2500f;
+                for(int i = 0; i < BasePlayer.activePlayerList.Count; i++)
+                {
+                    var activePlayer = BasePlayer.activePlayerList[i];
+
+                    float sqrMagnitude = (activePlayer.transform.position - player.transform.position).sqrMagnitude;
+                    if (sqrMagnitude <= (double)num2)
+                        ConsoleNetwork.SendClientCommand(activePlayer.net.connection, "chat.add2", 0, userId, message1, name, color, Mathf.Clamp01((float)(num2 - (double)sqrMagnitude + 0.200000002980232)));
+                }
+
+                
+                resultField.SetValue(__result, true);
+
+                return false;
+            }
+        }
+        #endregion
+    }
+}

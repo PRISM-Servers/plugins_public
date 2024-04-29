@@ -1,0 +1,114 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+
+namespace Oxide.Plugins
+{
+    [Info("Project Red | Red Testers", "MBR", "1.0.6")]
+    class RedTesters : RustPlugin
+    {
+        [PluginReference]
+        Plugin DiscordAPI2, Whitelist;
+
+        private bool running = false;
+        private Timer t;
+
+        private void OnServerInitialized()
+        {
+            if (!(DiscordAPI2?.IsLoaded ?? false) || !(Whitelist?.IsLoaded ?? false))
+            {
+                PrintError("DiscordAPI2/Whitelist not loaded");
+                Interface.Oxide.UnloadPlugin(Name);
+                return;
+            }
+
+            Fetch(true);
+
+            t = timer.Every(0.5f, () => Fetch());
+        }
+
+        private void Unload()
+        {
+            t?.Destroy();
+        }
+
+        private void Fetch(bool initial = false)
+        {
+            if (running) return;
+            running = true;
+
+            var token = DiscordAPI2?.Call<string>("GenerateToken", "2806_ryCtAdm33np!0g1N_2020", "redtesters_prism_red") ?? string.Empty;
+
+            if (string.IsNullOrEmpty(token))
+            {
+                PrintWarning("token is null/empty");
+                return;
+            }
+
+            var headers = new Dictionary<string, string>
+            {
+                { "User-Agent",  Name + "/" + Version },
+                { "Authorization", token }
+            };
+
+            var url = "https://prismrust.com/api/rust/red/testers?instant=" + initial.ToString().ToLower() + "&csv=true";
+            PrintWarning(url);
+
+            webrequest.Enqueue(url, null, (code, response) =>
+            {
+                running = false;
+
+                if (response == null) return;
+
+                if (!(Whitelist?.IsLoaded ?? false))
+                {
+                    PrintError("Whitelist missing on response");
+                    return;
+                }
+
+                if (code != 200)
+                {
+                    PrintWarning("Got a non 200 code: " + code);
+                    return;
+                }
+
+                var ids = response.Split(',');
+
+                PrintWarning("ids length: " + ids?.Length);
+
+                foreach (var player in covalence.Players.All.ToArray())
+                {
+                    if (Whitelist.Call<bool>("IsInWhitelist", player.Id))
+                    {
+                        if (!ids.Contains(player.Id))
+                        {
+                            Puts("Removing " + player.Id + " from whitelist");
+                            if (!Whitelist.Call<bool>("RemovePlayerFromWhitelist", player.Id))
+                            {
+                                PrintError("Failed to remove " + player.Id + " from whitelist");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (ids.Contains(player.Id))
+                        {
+                            Puts("Adding " + player.Id + " to whitelist");
+                            if (!Whitelist.Call<bool>("AddPlayerToWhitelist", player.Id))
+                            {
+                                PrintError("Failed to add " + player.Id + " to whitelist");
+                            }
+                        }
+                    }
+                }
+
+                PrintWarning("finished");
+
+            }, this, Core.Libraries.RequestMethod.GET, headers, 1000);
+
+            PrintWarning("past enqueue");
+        }
+    }
+}
